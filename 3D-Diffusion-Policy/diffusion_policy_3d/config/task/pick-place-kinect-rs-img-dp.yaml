@@ -1,0 +1,30 @@
+name: pick-place-kinect-rs-img-dp
+
+task_name: pick-place-kinect-rs-img-dp
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    rs_img:
+      shape: [3, 84, 84]
+      type: rgb
+    azure_img:
+      shape: [3, 84, 84]
+      type: rgb
+    agent_pos:
+      shape: [7]
+      type: low_dimx
+  action:
+    shape: [8]
+
+env_runner: null
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.realdex_dataset_dp.RealDexDatasetDP
+  zarr_path: data/1-12-complete/pick-place-kinect-rs-dp-img.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 90

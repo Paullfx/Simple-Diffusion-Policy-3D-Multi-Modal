@@ -30,7 +30,9 @@ def create_mlp(
         activation function
     :return:
     """
-
+    input_dim = int(input_dim)
+    # 确保 net_arch 中的所有元素都是整数
+    net_arch = [int(i) for i in net_arch]
     if len(net_arch) > 0:
         modules = [nn.Linear(input_dim, net_arch[0]), activation_fn()]
     else:
@@ -270,7 +272,6 @@ class DP3Encoder(nn.Module):
         # points = torch.transpose(points, 1, 2)   # B * 3 * N
         # points: B * 3 * (N + sum(Ni))
         pn_feat = self.extractor(points)    # B * out_channel
-            
         state = observations[self.state_key]
         state_feat = self.state_mlp(state)  # B * 64
         final_feat = torch.cat([pn_feat, state_feat], dim=-1)
