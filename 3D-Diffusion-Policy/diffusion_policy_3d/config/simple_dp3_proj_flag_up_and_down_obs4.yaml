@@ -1,5 +1,5 @@
 defaults:
-  - task: panda_pick_place_d455
+  - task: pick-place-l515
 
 name: train_simple_dp3
 
@@ -8,8 +8,8 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
-horizon: 3
-n_obs_steps: 2
+horizon: 4
+n_obs_steps: 4
 n_action_steps: 3
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
@@ -17,7 +17,7 @@ keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
 policy:
-  _target_: diffusion_policy_3d.policy.simple_dp3_proj_flag.SimpleDP3ProjFlag
+  _target_: diffusion_policy_3d.policy.simple_dp3_proj_flag_up_and_down.SimpleDP3ProjFlagUpAndDown
   use_point_crop: true
   condition_type: film
   use_down_condition: true
@@ -54,7 +54,7 @@ policy:
     prediction_type: sample
 
 
-  num_inference_steps: 10
+  num_inference_steps: 8
   obs_as_global_cond: true
   shape_meta: ${shape_meta}
 
@@ -72,7 +72,6 @@ policy:
     use_layernorm: true
     final_norm: layernorm # layernorm, none
     normal_channel: false
-
 
 ema:
   _target_: diffusion_policy_3d.model.diffusion.ema_model.EMAModel

@@ -63,12 +63,31 @@ class LinearNormalizer(DictOfTensorMixin):
                 raise RuntimeError("Not initialized")
             params = self.params_dict['_default']
             return _normalize(x, params, forward=forward)
+        
+    def custom_normalize_impl(self, x, forward=True):
+        if isinstance(x, dict):
+            result = dict()
+            for key, value in x.items():
+                params = self.params_dict[key]
+                result[key] = custom_normalize(value, params, forward=forward)
+            return result
+        else:
+            if '_default' not in self.params_dict:
+                raise RuntimeError("Not initialized")
+            params = self.params_dict['_default']
+            return custom_normalize(x, params, forward=forward)
 
     def normalize(self, x: Union[Dict, torch.Tensor, np.ndarray]) -> torch.Tensor:
         return self._normalize_impl(x, forward=True)
 
     def unnormalize(self, x: Union[Dict, torch.Tensor, np.ndarray]) -> torch.Tensor:
         return self._normalize_impl(x, forward=False)
+    
+    def custom_normalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        return custom_normalize(x, forward=True)
+    
+    def custom_unnormalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        return custom_normalize(x, forward=False)
 
     def get_input_stats(self) -> Dict:
         if len(self.params_dict) == 0:
@@ -167,6 +186,12 @@ class SingleFieldLinearNormalizer(DictOfTensorMixin):
 
     def unnormalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
         return _normalize(x, self.params_dict, forward=False)
+    
+    def custom_normalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        return custom_normalize(x, self.params_dict, forward=True)
+    
+    def custom_unnormalize(self, x: Union[torch.Tensor, np.ndarray]) -> torch.Tensor:
+        return custom_normalize(x, self.params_dict, forward=False)
 
     def get_input_stats(self):
         return self.params_dict['input_stats']
@@ -351,3 +376,22 @@ def test():
     dataun = n.unnormalize(datan)
     for key in data:
         assert torch.allclose(data[key], dataun[key], atol=1e-4)
+
+def custom_normalize(data, params, forward=True):
+    data_regression = data[:, :, :6]
+    data_classification = data[:, :, 6:]
+
+    regression_params = {
+        'scale': params['scale'][:6],
+        'offset': params['offset'][:6]
+    }
+
+    data_regression = _normalize(data_regression, regression_params, forward)
+
+    if forward:
+        data_classification = data_classification 
+    else:
+        data_classification = data_classification.round() 
+
+    normalized_data = torch.cat((data_regression, data_classification), dim=2)
+    return normalized_data

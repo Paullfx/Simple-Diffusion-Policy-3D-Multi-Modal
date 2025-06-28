@@ -9,25 +9,26 @@ from termcolor import cprint
 import copy
 import time
 import pytorch3d.ops as torch3d_ops
-from collections import OrderedDict
 
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.policy.base_policy import BasePolicy
-from diffusion_policy_3d.model.diffusion.conditional_unet1d import ConditionalUnet1D
+from diffusion_policy_3d.model.diffusion.simple_conditional_unet1d import ConditionalUnet1D
 from diffusion_policy_3d.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.model_util import print_params
 from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
 
-import time
+import casadi as ca
+import numpy as np
 
-class DP3(BasePolicy):
+class SimpleDP3ProjFlagCombine(BasePolicy):
     def __init__(self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             horizon, 
             n_action_steps, 
             n_obs_steps,
+            end_effector_length,
             num_inference_steps=None,
             obs_as_global_cond=True,
             diffusion_step_embed_dim=256,
@@ -43,12 +44,16 @@ class DP3(BasePolicy):
             use_pc_color=False,
             pointnet_type="pointnet",
             pointcloud_encoder_cfg=None,
+            train_gripper_length = 0.099,
             # parameters passed to step
             **kwargs):
         super().__init__()
 
+        self.end_effector_length = end_effector_length
         self.condition_type = condition_type
+        self.train_gripper_length = train_gripper_length
 
+        self.first_close = False
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
         self.action_shape = action_shape
@@ -61,7 +66,6 @@ class DP3(BasePolicy):
             
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
-
 
         obs_encoder = DP3Encoder(observation_space=obs_dict,
                                                    img_crop_shape=crop_shape,
@@ -85,10 +89,10 @@ class DP3(BasePolicy):
 
         self.use_pc_color = use_pc_color
         self.pointnet_type = pointnet_type
-        cprint(f"[DiffusionUnetHybridPointcloudPolicy] use_pc_color: {self.use_pc_color}", "yellow")
-        cprint(f"[DiffusionUnetHybridPointcloudPolicy] pointnet_type: {self.pointnet_type}", "yellow")
-
-
+        cprint(f"[SDP3] use_pc_color: {self.use_pc_color}", "yellow")
+        cprint(f"[SDP3] pointnet_type: {self.pointnet_type}", "yellow")
+        cprint(f"current gripper length: {self.end_effector_length} m", "yellow")
+        cprint(f"train gripper length: {train_gripper_length} m", "yellow")
 
         model = ConditionalUnet1D(
             input_dim=input_dim,
@@ -107,7 +111,7 @@ class DP3(BasePolicy):
         self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
-        
+        self.adapt_height = False
         
         self.noise_scheduler_pc = copy.deepcopy(noise_scheduler)
         self.mask_generator = LowdimMaskGenerator(
@@ -131,6 +135,7 @@ class DP3(BasePolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
 
+        self.previous_adopt_flag = None
 
         print_params(self)
         
@@ -139,13 +144,12 @@ class DP3(BasePolicy):
             condition_data, condition_mask,
             condition_data_pc=None, condition_mask_pc=None,
             local_cond=None, global_cond=None,
-            generator=None,
+            generator=None, cur_pose=None, Da=None, start=None, end=None, adopt_flag=None, adopt_flag_tar=None, tar_act=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
         model = self.model
         scheduler = self.noise_scheduler
-
 
         trajectory = torch.randn(
             size=condition_data.shape, 
@@ -155,39 +159,104 @@ class DP3(BasePolicy):
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
-
+        infernce_step = 0
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
-
+            # 2. sample from model
             model_output = model(sample=trajectory,
-                                timestep=t, 
+                                timestep=t,
                                 local_cond=local_cond, global_cond=global_cond)
             
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
                 model_output, t, trajectory, ).prev_sample
             
+            # 4. apply projection
+            if infernce_step >= 7:
+                # Unnormalize the action sequence
+                naction_pred = trajectory[..., :Da]
+                action_pred = self.normalizer['action'].unnormalize(naction_pred)
+                action = action_pred[:, start:end]
                 
+                # Apply projection in the unnormalized space
+                if tar_act is not None:
+                    action = self.projection_tar(cur_pose, action, condition_data.device, adopt_flag_tar, tar_act)
+                action = self.projection(cur_pose, action, condition_data.device, adopt_flag)
+                action_pred[:, start:end] = action
+                
+                # Normalize the action sequence again
+                trajectory[..., :Da] = self.normalizer['action'].normalize(action_pred)
+            
+            infernce_step += 1
+
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]   
+        trajectory[condition_mask] = condition_data[condition_mask] 
 
 
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, target_act: np.array, robot_cur_pose: np.array, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
         """
+        if robot_cur_pose.shape[0] != obs_dict['agent_pos'].shape[0]:
+            cur_pose = obs_dict['agent_pos']
+            print(f"robot_cur_pose shape: {robot_cur_pose.shape}, obs_dict['agent_pos'] shape: {obs_dict['agent_pos'].shape}")
+        else:
+            cur_pose = robot_cur_pose
+        bs = cur_pose.shape[0]
+        self.adopt_flag = torch.zeros(size=(bs, 1), device=self.device, dtype=torch.bool)
+        self.adopt_flag_tar = torch.zeros(size=(bs, 1), device=self.device, dtype=torch.bool)
+
+        # Define the rectangle bounds
+        x_min, y_min = 0.48, -0.118
+        x_max, y_max = 0.58, 0.014
+        z_max = 0.15
+
+        for i in range(bs):
+            x, y, z = cur_pose[i, -1, 0], cur_pose[i, -1, 1], cur_pose[i, -1, 2] # x and y at the last timestep
+            if x_min <= x <= x_max and y_min <= y <= y_max and z - self.end_effector_length < z_max:
+                self.adopt_flag[i] = True
+                self.adopt_flag_tar[i] = True
+    
+        if target_act is None:
+            tar_act = None
+        else:
+            tar_act = torch.tensor(target_act, device=self.device, dtype=torch.float32)
+
+        self.adopt_flag_tar = self.adopt_flag_tar.squeeze(-1)
+        self.adopt_flag = self.adopt_flag.squeeze(-1)
+        
+        # Gradual change logic
+        if self.previous_adopt_flag is None:
+            self.previous_adopt_flag = torch.zeros_like(self.adopt_flag)
+
+        for i in range(bs):
+            if self.adopt_flag[i] and not self.previous_adopt_flag[i]:
+                # Gradual change from False to True
+                for t in range(obs_dict['agent_pos'].shape[1]):
+                    obs_dict['agent_pos'][i, t, 2] -= (self.end_effector_length - self.train_gripper_length) * ((t + 1) / (obs_dict['agent_pos'].shape[1]))
+            elif not self.adopt_flag[i] and self.previous_adopt_flag[i]:
+                # Gradual change from True to False
+                for t in range(obs_dict['agent_pos'].shape[1]):
+                    obs_dict['agent_pos'][i, t, 2] -= (self.end_effector_length - self.train_gripper_length) * ((obs_dict['agent_pos'].shape[1] - t - 1) / (obs_dict['agent_pos'].shape[1]))
+            elif self.adopt_flag[i] and self.previous_adopt_flag[i]:
+                # Keep the height constant
+                obs_dict['agent_pos'][i, :, 2] = obs_dict['agent_pos'][i, :, 2] - (self.end_effector_length - self.train_gripper_length)
+        
+        self.previous_adopt_flag = self.adopt_flag.clone()
+
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
         # this_n_point_cloud = nobs['imagin_robot'][..., :3] # only use coordinate
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
         this_n_point_cloud = nobs['point_cloud']
+        
         
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
@@ -206,7 +275,6 @@ class DP3(BasePolicy):
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            # 输出是B*T*128
             nobs_features = self.obs_encoder(this_nobs)
             if "cross_attention" in self.condition_type:
                 # treat as a sequence
@@ -228,32 +296,33 @@ class DP3(BasePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
+        # get action
+        start = To - 1
+        end = start + self.n_action_steps
+        
+
         # run sampling
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
+            cur_pose=cur_pose, Da=Da, start=start, end=end, adopt_flag=self.adopt_flag, adopt_flag_tar=self.adopt_flag_tar, tar_act=tar_act,
             **self.kwargs)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
-        # get action
-        start = To - 1
-        end = start + self.n_action_steps
         action = action_pred[:,start:end]
-        
+
         # get prediction
-
-
         result = {
             'action': action,
             'action_pred': action_pred,
         }
         
-        return result
+        return result, self.adopt_flag
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -261,12 +330,12 @@ class DP3(BasePolicy):
 
     def compute_loss(self, batch):
         # normalize input
-
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
 
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
+        
         
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -276,8 +345,6 @@ class DP3(BasePolicy):
         global_cond = None
         trajectory = nactions
         cond_data = trajectory
-        
-       
         
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
@@ -364,53 +431,168 @@ class DP3(BasePolicy):
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         
-
         loss_dict = {
                 'bc_loss': loss.item(),
             }
-
-        # print(f"t2-t1: {t2-t1:.3f}")
-        # print(f"t3-t2: {t3-t2:.3f}")
-        # print(f"t4-t3: {t4-t3:.3f}")
-        # print(f"t5-t4: {t5-t4:.3f}")
-        # print(f"t6-t5: {t6-t5:.3f}")
-        
         return loss, loss_dict
-
-if __name__ == "__main__":
-    import yaml
-
-    yaml_data = """
-    shape_meta: &shape_meta
-        obs:
-            point_cloud:
-                shape: [512, 3]
-                type: point_cloud
-            agent_pos:
-                shape: [24]
-                type: low_dim
-        action:
-            shape: [24]
-    """
-
-    # 使用 yaml 库的 load 方法将 YAML 数据转换为字典
-    shape_meta = yaml.safe_load(yaml_data)
-    obs_shape_meta = shape_meta['shape_meta']['obs']
-    print(obs_shape_meta)
-    def dict_apply(d, func):
-        return {k: func(v) for k, v in d.items()}
-
-    obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
-    observations = OrderedDict({
-        'point_cloud': torch.randn(20, 512, 3),  # 10个样本，每个样本有100个点，每个点有3个坐标
-        'agent_pos': torch.randn(20, 24),  # 10个样本，每个样本有一个代理位置
-        'imagin_robot': torch.randn(10, 2, 100, 3),  # 10个样本，每个样本有一个想象中的机器人位置
-    })
-    from omegaconf import OmegaConf
     
-    cfg = OmegaConf.load('3D-Diffusion-Policy/3D-Diffusion-Policy/diffusion_policy_3d/config/dp3.yaml')
+    def projection(self, pose, x_init, device, adopt_flag):
+        """
+        x_init: Tensor of shape (B, T, D_a)
+        pose: Tensor of shape (B, D_p) where D_p >= 3
+        """
+        if isinstance(x_init, torch.Tensor):
+            x_init_np = x_init.detach().cpu().numpy()
+            torch_dtype = x_init.dtype
+        else:
+            x_init_np = x_init
+            torch_dtype = numpy_to_torch_dtype(x_init.dtype)
 
-    pointcloud_encoder_cfg = cfg.policy.pointcloud_encoder_cfg
-    encoder = DP3Encoder(observation_space=obs_dict, pointcloud_encoder_cfg=pointcloud_encoder_cfg)
-    encoded_observations = encoder(observations)
-    print(encoded_observations.shape)
+        if isinstance(pose, torch.Tensor):
+            pose = pose.detach().cpu().numpy()
+        
+        B, T, D_a = x_init_np.shape
+        
+        x_proj = np.zeros_like(x_init_np)
+        
+        for b in range(B):
+            cumulative_pose = pose[b, :].copy()
+            cumulative_pose = np.squeeze(cumulative_pose, axis=0)
+
+            x_proj_vars = np.zeros(T)
+
+            for t in range(T):
+                x_var = ca.SX.sym('x', 1)
+                x_init_dm = ca.DM([x_init_np[b, t, 2]])  # Extract the third element for the current timestep
+                
+                ## Objective function: minimize the squared L2 norm between x_var and x_init_dm
+                obj = ca.sumsqr(x_var - x_init_dm)
+                
+                ## Constraints for the current timestep
+                if self.adapt_height:
+                    g_t = cumulative_pose[2] + x_var
+                else:
+                    if adopt_flag[b] == True:
+                        g_t = cumulative_pose[2] + x_var - self.train_gripper_length
+                    else:
+                        g_t = cumulative_pose[2] + x_var - self.end_effector_length
+                
+                g = [g_t]
+                lbg = [0.01]
+                ubg = [ca.inf]
+                
+                nlp = {'x': x_var, 'f': obj, 'g': ca.vertcat(*g)}
+
+                ## Suppress CasADi output by setting solver options
+                solver = ca.nlpsol(
+                    'solver', 'ipopt', nlp,
+                    {'print_time': False, 'ipopt': {'print_level': 0}}
+                )
+
+                ## Solve the problem
+                sol = solver(x0=x_init_dm, lbg=lbg, ubg=ubg)
+                x_proj_vars[t] = sol['x'].full().flatten()[0]
+                
+                ## Update cumulative_pose[2] with the current step's x_var
+                cumulative_pose[2] += x_proj_vars[t]
+            
+            ## Reconstruct full x_proj
+            x_proj[b, :, :] = x_init_np[b, :, :]
+            x_proj[b, :, 2] = x_proj_vars
+
+        x_proj_tensor = torch.from_numpy(x_proj).to(torch_dtype).to(device)      
+        return x_proj_tensor
+
+    def projection_tar(self, pose, x_init, device, adopt_flag_tar, tar_act):
+        if isinstance(x_init, torch.Tensor):
+            x_init_np = x_init.detach().cpu().numpy()
+            torch_dtype = x_init.dtype
+        else:
+            x_init_np = x_init
+            torch_dtype = numpy_to_torch_dtype(x_init.dtype)
+
+        if isinstance(pose, torch.Tensor):
+            pose = pose.detach().cpu().numpy()
+        
+        if isinstance(tar_act, torch.Tensor):
+            tar_act_np = tar_act.detach().cpu().numpy()
+        else:
+            tar_act_np = tar_act
+        
+        B, T, D_a = x_init_np.shape
+        
+        x_proj = np.zeros_like(x_init_np)
+
+        for b in range(B):
+            skip_optimization = False
+            gripper_close = False
+            if (x_init_np[b, 0, 7] - x_init_np[b, 0, 6]) >= 0.5:
+                gripper_close = True
+
+            if gripper_close and adopt_flag_tar[b]:
+                self.first_close = True
+            
+            if not self.first_close:
+                x_proj[b, :, :] = x_init_np[b, :, :]
+                continue
+
+            cumulative_pose = pose[b, :].copy()
+            cumulative_pose = np.squeeze(cumulative_pose, axis=0)
+            
+            x_init_vars = x_init_np[b, :, 0].copy()
+            y_init_vars = x_init_np[b, :, 1].copy()
+            z_init_vars = x_init_np[b, :, 2].copy()
+            
+            target_x = tar_act_np[b, 0, 0]
+            target_y = tar_act_np[b, 0, 1]
+            target_z = tar_act_np[b, 0, 2]
+
+            x_vars = ca.SX.sym('x', T)
+            y_vars = ca.SX.sym('y', T)
+            z_vars = ca.SX.sym('z', T)
+            
+            obj = ca.sumsqr(x_vars - x_init_vars) + ca.sumsqr(y_vars - y_init_vars) + ca.sumsqr(z_vars - z_init_vars)
+
+            final_x = cumulative_pose[0] + ca.sum1(x_vars)
+            final_y = cumulative_pose[1] + ca.sum1(y_vars)
+            final_z = cumulative_pose[2] + ca.sum1(z_vars)
+            
+            g = ca.sqrt((final_x - target_x)**2 + (final_y - target_y)**2 + (final_z - target_z)**2)
+            lbg = [0] 
+            ubg = [0.005] 
+            
+            nlp = {'x': ca.vertcat(x_vars, y_vars, z_vars), 'f': obj, 'g': g}
+            
+            solver = ca.nlpsol("solver", "ipopt", nlp,
+                   {"print_time": False, "ipopt": {"print_level": 0}})
+            
+            x0 = ca.vertcat(x_init_vars, y_init_vars, z_init_vars)
+            sol = solver(x0=x0, lbg=lbg, ubg=ubg)
+            sol_vec = sol["x"].full().ravel()         
+
+            x_proj_vars = sol_vec[0:T]
+            y_proj_vars = sol_vec[T : 2*T]
+            z_proj_vars = sol_vec[2*T : 3*T]           # ← NEW
+
+            x_proj[b, :, :]  = x_init_np[b, :, :]      # keep the rest unchanged
+            x_proj[b, :, 0]  = x_proj_vars
+            x_proj[b, :, 1]  = y_proj_vars
+            x_proj[b, :, 2]  = z_proj_vars             # ← store the optimised z
+            x_proj[b, :, 6:] = tar_act_np[b, 0, 6:]    
+        
+        x_proj_tensor = torch.from_numpy(x_proj).to(torch_dtype).to(device)      
+        return x_proj_tensor
+
+    
+def numpy_to_torch_dtype(np_dtype):
+    if np_dtype == np.float32:
+        return torch.float32
+    elif np_dtype == np.float64:
+        return torch.float64
+    elif np_dtype == np.int32:
+        return torch.int32
+    elif np_dtype == np.int64:
+        return torch.int64
+    else:
+        raise TypeError(f"Unsupported NumPy dtype: {np_dtype}")
+

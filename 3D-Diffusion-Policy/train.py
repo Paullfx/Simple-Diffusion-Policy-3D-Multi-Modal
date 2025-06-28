@@ -59,6 +59,30 @@ class TrainDP3Workspace:
             except: # minkowski engine could not be copied. recreate it
                 self.ema_model = hydra.utils.instantiate(cfg.policy)
 
+                # ---------- 修正版 wrapper ----------
+        def wrap_predict_action(orig_fn):
+            def _fn(obs_in, *args, **kwargs):
+                # Case 1: 直接 Tensor
+                if isinstance(obs_in, torch.Tensor):
+                    obs_in = {'obs': obs_in}
+
+                # Case 2: 单层字典，含 'agent_pos' 而无 'obs'
+                elif isinstance(obs_in, dict) and 'obs' not in obs_in:
+                    if 'agent_pos' in obs_in:          # Dataset 输出这种
+                        obs_in = {'obs': obs_in['agent_pos']}
+                    else:
+                        raise ValueError(
+                            "Unrecognized obs structure passed to predict_action")
+
+                # Case 3: 已经包含 'obs' 键 → 直接透传
+                return orig_fn(obs_in, *args, **kwargs)
+            return _fn
+
+        self.model.predict_action = wrap_predict_action(self.model.predict_action)
+        if self.ema_model is not None:
+            self.ema_model.predict_action = wrap_predict_action(self.ema_model.predict_action)
+        # ------------------------------------
+
 
         # configure training state
         self.optimizer = hydra.utils.instantiate(
@@ -286,9 +310,14 @@ class TrainDP3Workspace:
                     # sample trajectory from training set, and evaluate difference
                     batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                     obs_dict = batch['obs']
+                   
                     gt_action = batch['action']
                     
+                    # debug session
+                    # print(f"[DEBUG] batch['obs'] type = {type(batch['obs'])}")
+                    
                     result = policy.predict_action(obs_dict)
+                    
                     pred_action = result['action_pred']
                     mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                     step_log['train_action_mse_error'] = mse.item()

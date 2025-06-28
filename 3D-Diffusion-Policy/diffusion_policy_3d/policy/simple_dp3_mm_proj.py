@@ -9,25 +9,52 @@ from termcolor import cprint
 import copy
 import time
 import pytorch3d.ops as torch3d_ops
-from collections import OrderedDict
 
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.policy.base_policy import BasePolicy
-from diffusion_policy_3d.model.diffusion.conditional_unet1d import ConditionalUnet1D
+from diffusion_policy_3d.model.diffusion.simple_conditional_unet1d import ConditionalUnet1D
 from diffusion_policy_3d.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.model_util import print_params
-from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
+from diffusion_policy_3d.model.vision.multi_modal_obs_encoder import MultiModalEncoder
 
-import time
+import casadi as ca
+import numpy as np
 
-class DP3(BasePolicy):
+def custom_loss(pred, target, mask):
+    pred_regression = pred[:, :, :6]
+    target_regression = target[:, :, :6]
+
+    pred_classification = pred[:, :, 6:]
+    target_classification = target[:, :, 6:]
+    target_classification = torch.argmax(target_classification, dim=-1)
+
+    mse_loss = F.mse_loss(pred_regression, target_regression, reduction='none')
+    mse_loss = mse_loss * mask[:, :, :6].type(mse_loss.dtype)
+    mse_loss = reduce(mse_loss, 'b ... -> b', 'mean')  
+    mse_loss = mse_loss.mean()
+
+    cross_entropy_loss = F.cross_entropy(pred_classification.permute(0, 2, 1), target_classification, reduction='none')
+    cross_entropy_loss = cross_entropy_loss * mask[:, :, 0].type(cross_entropy_loss.dtype)
+    cross_entropy_loss = reduce(cross_entropy_loss, 'b ... -> b', 'mean') 
+    cross_entropy_loss = cross_entropy_loss.mean()
+    
+    weight_mse = 1.0  
+    weight_ce = 1.0   
+    
+    loss = weight_mse * mse_loss + weight_ce * cross_entropy_loss
+    return loss
+
+class SimpleDP3MMProj(BasePolicy):
     def __init__(self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
+            multi_modal_encoder: MultiModalEncoder,
             horizon, 
             n_action_steps, 
             n_obs_steps,
+            end_effector_length,
+            adapt_height,
             num_inference_steps=None,
             obs_as_global_cond=True,
             diffusion_step_embed_dim=256,
@@ -35,20 +62,21 @@ class DP3(BasePolicy):
             kernel_size=5,
             n_groups=8,
             condition_type="film",
+            encoder_output_dim = 256,
             use_down_condition=True,
             use_mid_condition=True,
             use_up_condition=True,
-            encoder_output_dim=256,
-            crop_shape=None,
             use_pc_color=False,
             pointnet_type="pointnet",
-            pointcloud_encoder_cfg=None,
-            # parameters passed to step
+            train_gripper_length = 0.099,
             **kwargs):
         super().__init__()
 
+        self.adapt_height = adapt_height
         self.condition_type = condition_type
 
+        self.train_gripper_length = train_gripper_length
+        self.end_effector_length = end_effector_length
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
         self.action_shape = action_shape
@@ -62,17 +90,8 @@ class DP3(BasePolicy):
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
-
-        obs_encoder = DP3Encoder(observation_space=obs_dict,
-                                                   img_crop_shape=crop_shape,
-                                                out_channel=encoder_output_dim,
-                                                pointcloud_encoder_cfg=pointcloud_encoder_cfg,
-                                                use_pc_color=use_pc_color,
-                                                pointnet_type=pointnet_type,
-                                                )
-
         # create diffusion model
-        obs_feature_dim = obs_encoder.output_shape()
+        obs_feature_dim = multi_modal_encoder.output_shape()[0]
         input_dim = action_dim + obs_feature_dim
         global_cond_dim = None
         if obs_as_global_cond:
@@ -85,10 +104,11 @@ class DP3(BasePolicy):
 
         self.use_pc_color = use_pc_color
         self.pointnet_type = pointnet_type
-        cprint(f"[DiffusionUnetHybridPointcloudPolicy] use_pc_color: {self.use_pc_color}", "yellow")
-        cprint(f"[DiffusionUnetHybridPointcloudPolicy] pointnet_type: {self.pointnet_type}", "yellow")
-
-
+        cprint(f"[SDP3] use_pc_color: {self.use_pc_color}", "yellow")
+        cprint(f"[SDP3] pointnet_type: {self.pointnet_type}", "yellow")
+        cprint(f"current gripper length: {self.end_effector_length} m", "yellow")
+        cprint(f"train gripper length: {self.train_gripper_length} m", "yellow")
+        cprint(f"adapt height: {self.adapt_height}", "yellow")
 
         model = ConditionalUnet1D(
             input_dim=input_dim,
@@ -104,7 +124,7 @@ class DP3(BasePolicy):
             use_up_condition=use_up_condition,
         )
 
-        self.obs_encoder = obs_encoder
+        self.obs_encoder = multi_modal_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
         
@@ -139,14 +159,14 @@ class DP3(BasePolicy):
             condition_data, condition_mask,
             condition_data_pc=None, condition_mask_pc=None,
             local_cond=None, global_cond=None,
-            generator=None,
+            generator=None, obs_dict=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
         model = self.model
         scheduler = self.noise_scheduler
 
-
+        pose = obs_dict['agent_pos'][:, -1, :]
         trajectory = torch.randn(
             size=condition_data.shape, 
             dtype=condition_data.dtype,
@@ -155,11 +175,10 @@ class DP3(BasePolicy):
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
-
+        infernce_step = 0
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
-
 
             model_output = model(sample=trajectory,
                                 timestep=t, 
@@ -169,7 +188,12 @@ class DP3(BasePolicy):
             trajectory = scheduler.step(
                 model_output, t, trajectory, ).prev_sample
             
-                
+            # 4. apply projection
+            if infernce_step >= 7:
+                trajectory = self.projection(pose, trajectory, condition_data.device)
+            
+            infernce_step += 1
+
         # finally make sure conditioning is enforced
         trajectory[condition_mask] = condition_data[condition_mask]   
 
@@ -182,12 +206,15 @@ class DP3(BasePolicy):
         obs_dict: must include "obs" key
         result: must include "action" key
         """
+        # if self.adapt_height:
+        #     obs_dict['agent_pos'][:, :, 2] = obs_dict['agent_pos'][:, :, 2] - self.end_effector_length
         # normalize input
         nobs = self.normalizer.normalize(obs_dict)
         # this_n_point_cloud = nobs['imagin_robot'][..., :3] # only use coordinate
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
         this_n_point_cloud = nobs['point_cloud']
+        
         
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
@@ -206,7 +233,6 @@ class DP3(BasePolicy):
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            # 输出是B*T*128
             nobs_features = self.obs_encoder(this_nobs)
             if "cross_attention" in self.condition_type:
                 # treat as a sequence
@@ -234,10 +260,12 @@ class DP3(BasePolicy):
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
+            obs_dict=obs_dict,
             **self.kwargs)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
+        #action_pred = self.normalizer['action'].custom_unnormalize(naction_pred)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
@@ -246,7 +274,6 @@ class DP3(BasePolicy):
         action = action_pred[:,start:end]
         
         # get prediction
-
 
         result = {
             'action': action,
@@ -260,13 +287,16 @@ class DP3(BasePolicy):
         self.normalizer.load_state_dict(normalizer.state_dict())
 
     def compute_loss(self, batch):
+        # if self.adapt_height:
+        #     batch['obs']['agent_pos'][:, :, 2] = batch['obs']['agent_pos'][:, :, 2] - self.end_effector_length
         # normalize input
-
         nobs = self.normalizer.normalize(batch['obs'])
+        #nactions = self.normalizer['action'].custom_normalize(batch['action'])
         nactions = self.normalizer['action'].normalize(batch['action'])
 
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
+        
         
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -276,8 +306,6 @@ class DP3(BasePolicy):
         global_cond = None
         trajectory = nactions
         cond_data = trajectory
-        
-       
         
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
@@ -359,12 +387,12 @@ class DP3(BasePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
+        #loss = custom_loss(pred, target, loss_mask)
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         
-
         loss_dict = {
                 'bc_loss': loss.item(),
             }
@@ -376,41 +404,88 @@ class DP3(BasePolicy):
         # print(f"t6-t5: {t6-t5:.3f}")
         
         return loss, loss_dict
-
-if __name__ == "__main__":
-    import yaml
-
-    yaml_data = """
-    shape_meta: &shape_meta
-        obs:
-            point_cloud:
-                shape: [512, 3]
-                type: point_cloud
-            agent_pos:
-                shape: [24]
-                type: low_dim
-        action:
-            shape: [24]
-    """
-
-    # 使用 yaml 库的 load 方法将 YAML 数据转换为字典
-    shape_meta = yaml.safe_load(yaml_data)
-    obs_shape_meta = shape_meta['shape_meta']['obs']
-    print(obs_shape_meta)
-    def dict_apply(d, func):
-        return {k: func(v) for k, v in d.items()}
-
-    obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
-    observations = OrderedDict({
-        'point_cloud': torch.randn(20, 512, 3),  # 10个样本，每个样本有100个点，每个点有3个坐标
-        'agent_pos': torch.randn(20, 24),  # 10个样本，每个样本有一个代理位置
-        'imagin_robot': torch.randn(10, 2, 100, 3),  # 10个样本，每个样本有一个想象中的机器人位置
-    })
-    from omegaconf import OmegaConf
     
-    cfg = OmegaConf.load('3D-Diffusion-Policy/3D-Diffusion-Policy/diffusion_policy_3d/config/dp3.yaml')
+    def projection(self, pose, x_init, device):
+        """
+        x_init: Tensor of shape (B, T, D_a)
+        pose: Tensor of shape (B, D_p) where D_p >= 3
+        """
+        if isinstance(x_init, torch.Tensor):
+            x_init_np = x_init.detach().cpu().numpy()
+            torch_dtype = x_init.dtype
+        else:
+            x_init_np = x_init
+            torch_dtype = numpy_to_torch_dtype(x_init.dtype)
 
-    pointcloud_encoder_cfg = cfg.policy.pointcloud_encoder_cfg
-    encoder = DP3Encoder(observation_space=obs_dict, pointcloud_encoder_cfg=pointcloud_encoder_cfg)
-    encoded_observations = encoder(observations)
-    print(encoded_observations.shape)
+        if isinstance(pose, torch.Tensor):
+            pose = pose.detach().cpu().numpy()
+        
+        B, T, D_a = x_init_np.shape
+        
+        x_proj = np.zeros_like(x_init_np)
+        
+        for b in range(B):
+            # Initialize cumulative_pose for the batch
+            cumulative_pose = pose[b, :].copy()
+
+            # if self.end_effector_length >= self.train_gripper_length:
+            x_var = ca.SX.sym('x', T)
+            x_init_dm = ca.DM(x_init_np[b, :, 2])  # Extract the third element for all timesteps
+            
+            ## Objective function: minimize the squared L2 norm between x_var and x_init_dm
+            obj = ca.sumsqr(x_var - x_init_dm)
+            
+            ## Constraints for the entire sequence
+            if self.adapt_height:
+                g1 = cumulative_pose[2] - ca.sum1(x_var)
+            else:
+                g1 = cumulative_pose[2] - ca.sum1(x_var) - self.end_effector_length
+            
+            ## Ensure the sum of x_var has the same sign as the sum of x_init_dm
+            sum_x_init_dm = ca.sum1(x_init_dm)
+            sum_x_var = ca.sum1(x_var)
+            
+            if sum_x_init_dm >= 0:
+                g2 = sum_x_var
+                lbg2 = 0
+                ubg2 = ca.inf
+            else:
+                g2 = -sum_x_var
+                lbg2 = 0
+                ubg2 = ca.inf
+            
+            nlp = {'x': x_var, 'f': obj, 'g': ca.vertcat(g1, g2)}
+            
+            ## Suppress CasADi output by setting solver options
+            solver = ca.nlpsol(
+                'solver', 'ipopt', nlp,
+                {'print_time': False, 'ipopt': {'print_level': 0}}
+            )
+            
+            lbg = ca.vertcat(0, lbg2)   # Lower bound for g1 and g2
+            ubg = ca.vertcat(ca.inf, ubg2)  # Upper bound for g1 and g2
+            
+            ## Solve the problem
+            sol = solver(x0=x_init_dm, lbg=lbg, ubg=ubg)
+            x_proj_vars = sol['x'].full().flatten()
+            
+            print("original x_init_dm: ", x_init_dm)
+            print("x_proj_vars: ", x_proj_vars)
+            ## Reconstruct full x_proj
+            x_proj[b, :, :] = x_init_np[b, :, :]
+            x_proj[b, :, 2] = x_proj_vars
+        
+        x_proj_tensor = torch.from_numpy(x_proj).to(torch_dtype).to(device)        
+        return x_proj_tensor
+    
+def numpy_to_torch_dtype(np_dtype):
+    if np_dtype == np.float32:
+        return torch.float32
+    elif np_dtype == np.float64:
+        return torch.float64
+    elif np_dtype == np.int32:
+        return torch.int32
+    elif np_dtype == np.int64:
+        return torch.int64
+    else:
+        raise TypeError(f"Unsupported NumPy dtype: {np_dtype}")

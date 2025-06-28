@@ -1,5 +1,5 @@
 defaults:
-  - task: adroit_hammer
+  - task: pick-place-l515
 
 name: train_simple_dp3
 
@@ -10,7 +10,7 @@ exp_name: "debug"
 
 horizon: 4
 n_obs_steps: 2
-n_action_steps: 3
+n_action_steps: 4
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
@@ -62,7 +62,6 @@ policy:
   # type of pointnet
   pointnet_type: "pointnet"
 
-
   pointcloud_encoder_cfg:
     in_channels: 3
     out_channels: ${policy.encoder_output_dim}
@@ -107,7 +106,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3000
+  num_epochs: 8000
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 200

@@ -1,78 +1,48 @@
 defaults:
-  - task: panda_pick_place_d455
+  - task: pick-place-kinect-rs-img-dp
 
-name: train_simple_dp3
+name: train_ibc_p
 
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
-horizon: 3
+horizon: 2
 n_obs_steps: 2
-n_action_steps: 3
+n_action_steps: 1
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
-obs_as_global_cond: True
+past_action_visible: False
 
 policy:
-  _target_: diffusion_policy_3d.policy.simple_dp3_proj_flag.SimpleDP3ProjFlag
-  use_point_crop: true
-  condition_type: film
-  use_down_condition: true
-  use_mid_condition: true
-  use_up_condition: true
-  train_gripper_length: 0.099
-  end_effector_length: 0.099
-  
-  diffusion_step_embed_dim: 128
-  #main difference between simple_dp3 and dp3
-  down_dims:
-  - 128
-  - 256
-  - 384
-  crop_shape:
-  - 80
-  - 80
-  encoder_output_dim: 64
-  horizon: ${horizon}
-  kernel_size: 5
+  _target_: diffusion_policy_3d.policy.ibc_p.IbcHybridP
+  dropout:          0.1
+  train_n_neg:      1024
+  pred_n_iter:      5
+  pred_n_samples:   16384
+  kevin_inference:  false
+  andy_train:       false
+
+  shape_meta:     ${shape_meta}
+  horizon:        ${horizon}
   n_action_steps: ${n_action_steps}
-  n_groups: 8
-  n_obs_steps: ${n_obs_steps}
+  n_obs_steps:    ${n_obs_steps}
 
-  noise_scheduler:
-    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
-    num_train_timesteps: 100
-    beta_start: 0.0001
-    beta_end: 0.02
-    beta_schedule: squaredcos_cap_v2
-    clip_sample: True
-    set_alpha_to_one: True
-    steps_offset: 0
-    prediction_type: sample
-
-
-  num_inference_steps: 10
-  obs_as_global_cond: true
-  shape_meta: ${shape_meta}
-
-
-
-  # whether to use point cloud's color
-  use_pc_color: false
-  # type of pointnet
-  pointnet_type: "pointnet"
-
-
-  pointcloud_encoder_cfg:
-    in_channels: 3
-    out_channels: ${policy.encoder_output_dim}
-    use_layernorm: true
-    final_norm: layernorm # layernorm, none
-    normal_channel: false
-
+  obs_encoder:
+    _target_: diffusion_policy_3d.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
+    shape_meta: ${shape_meta}
+    rgb_model:
+      _target_: diffusion_policy_3d.model.vision.model_getter.get_resnet
+      name: resnet18
+      weights: null
+    resize_shape: null
+    crop_shape: [76, 76]
+    random_crop: True
+    use_group_norm: True
+    share_rgb_model: False
+    imagenet_norm: True
 
 ema:
   _target_: diffusion_policy_3d.model.diffusion.ema_model.EMAModel
@@ -110,9 +80,9 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 6000
+  num_epochs: 8000
   gradient_accumulate_every: 1
-  use_ema: True
+  use_ema: False
   rollout_every: 200
   checkpoint_every: 200
   val_every: 1
@@ -130,7 +100,6 @@ logging:
   resume: true
   tags:
   - dp3
-
 
 checkpoint:
   save_ckpt: False # if True, save checkpoint every checkpoint_every

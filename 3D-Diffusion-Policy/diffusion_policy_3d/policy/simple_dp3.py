@@ -17,6 +17,31 @@ from diffusion_policy_3d.model.diffusion.mask_generator import LowdimMaskGenerat
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.model_util import print_params
 from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
+import time
+
+def custom_loss(pred, target, mask):
+    pred_regression = pred[:, :, :6]
+    target_regression = target[:, :, :6]
+
+    pred_classification = pred[:, :, 6:]
+    target_classification = target[:, :, 6:]
+    target_classification = torch.argmax(target_classification, dim=-1)
+
+    mse_loss = F.mse_loss(pred_regression, target_regression, reduction='none')
+    mse_loss = mse_loss * mask[:, :, :6].type(mse_loss.dtype)
+    mse_loss = reduce(mse_loss, 'b ... -> b', 'mean')  
+    mse_loss = mse_loss.mean()
+
+    cross_entropy_loss = F.cross_entropy(pred_classification.permute(0, 2, 1), target_classification, reduction='none')
+    cross_entropy_loss = cross_entropy_loss * mask[:, :, 0].type(cross_entropy_loss.dtype)
+    cross_entropy_loss = reduce(cross_entropy_loss, 'b ... -> b', 'mean') 
+    cross_entropy_loss = cross_entropy_loss.mean()
+    
+    weight_mse = 1.0  
+    weight_ce = 1.0   
+    
+    loss = weight_mse * mse_loss + weight_ce * cross_entropy_loss
+    return loss
 
 class SimpleDP3(BasePolicy):
     def __init__(self, 
@@ -43,7 +68,6 @@ class SimpleDP3(BasePolicy):
             # parameters passed to step
             **kwargs):
         super().__init__()
-
         self.condition_type = condition_type
 
         # parse shape_meta
@@ -58,7 +82,6 @@ class SimpleDP3(BasePolicy):
             
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
-
 
         obs_encoder = DP3Encoder(observation_space=obs_dict,
                                                    img_crop_shape=crop_shape,
@@ -103,7 +126,6 @@ class SimpleDP3(BasePolicy):
         self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
-        
         
         self.noise_scheduler_pc = copy.deepcopy(noise_scheduler)
         self.mask_generator = LowdimMaskGenerator(
@@ -197,6 +219,7 @@ class SimpleDP3(BasePolicy):
         device = self.device
         dtype = self.dtype
 
+        obs_start_time = time.time()
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
@@ -224,6 +247,7 @@ class SimpleDP3(BasePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
+        sample_start_time = time.time()
         # run sampling
         nsample = self.conditional_sample(
             cond_data, 
@@ -234,22 +258,25 @@ class SimpleDP3(BasePolicy):
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
+        #action_pred = self.normalizer['action'].custom_unnormalize(naction_pred)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
         start = To - 1
         end = start + self.n_action_steps
         action = action_pred[:,start:end]
-        
+        adopt_flag = torch.zeros(size=(B, 1), device=self.device, dtype=torch.bool)
+        adopt_flag = adopt_flag.squeeze(-1)
         # get prediction
 
-
+        # print(action)
         result = {
             'action': action,
             'action_pred': action_pred,
         }
         
-        return result
+        print("action_shape:", action.shape)
+        return result, adopt_flag
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -263,17 +290,14 @@ class SimpleDP3(BasePolicy):
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
         
-        
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
-
+        # print(f"nactions shape: {nactions.shape}")
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
         trajectory = nactions
         cond_data = trajectory
-        
-       
         
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
@@ -298,7 +322,6 @@ class SimpleDP3(BasePolicy):
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory = cond_data.detach()
-
 
         # generate impainting mask
         condition_mask = self.mask_generator(trajectory.shape)
@@ -328,13 +351,11 @@ class SimpleDP3(BasePolicy):
         noisy_trajectory[condition_mask] = cond_data[condition_mask]
 
         # Predict the noise residual
-        
         pred = self.model(sample=noisy_trajectory, 
                         timestep=timesteps, 
                             local_cond=local_cond, 
                             global_cond=global_cond)
-
-
+        
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
             target = noise
@@ -355,12 +376,12 @@ class SimpleDP3(BasePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
+        #loss = custom_loss(pred, target, loss_mask)
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         
-
         loss_dict = {
                 'bc_loss': loss.item(),
             }

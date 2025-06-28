@@ -10,7 +10,7 @@ from diffusion_policy_3d.common.sampler import (
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
 from diffusion_policy_3d.dataset.base_dataset import BaseDataset
 
-class RealDexDataset(BaseDataset):
+class RealDexDatasetState(BaseDataset):
     def __init__(self,
             zarr_path, 
             horizon=1,
@@ -24,7 +24,7 @@ class RealDexDataset(BaseDataset):
         super().__init__()
         self.task_name = task_name
         self.replay_buffer = ReplayBuffer.copy_from_path(
-            zarr_path, keys=['state', 'action', 'point_cloud'])
+            zarr_path, keys=['state', 'action'])
         val_mask = get_val_mask(
             n_episodes=self.replay_buffer.n_episodes, 
             val_ratio=val_ratio,
@@ -62,12 +62,10 @@ class RealDexDataset(BaseDataset):
     def get_normalizer(self, mode='limits', **kwargs):
         data = {
             'action': self.replay_buffer['action'],
-            'agent_pos': self.replay_buffer['state'][...,:],
-            'point_cloud': self.replay_buffer['point_cloud'],
+            'obs': self.replay_buffer['state'][...,:]
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
-        # normalizer['point_cloud'] = SingleFieldLinearNormalizer.create_identity()
         return normalizer
 
     def __len__(self) -> int:
@@ -75,13 +73,9 @@ class RealDexDataset(BaseDataset):
 
     def _sample_to_data(self, sample):
         agent_pos = sample['state'][:,].astype(np.float32)
-        point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 1024, 6)
 
         data = {
-            'obs': {
-                'point_cloud': point_cloud, # T, 1024, 6
-                'agent_pos': agent_pos, # T, D_pos
-            },
+            'obs': agent_pos, # T, D_obs
             'action': sample['action'].astype(np.float32) # T, D_action
         }
         return data
@@ -91,22 +85,3 @@ class RealDexDataset(BaseDataset):
         data = self._sample_to_data(sample)
         torch_data = dict_apply(data, torch.from_numpy)
         return torch_data
-
-def main():
-    # 创建 RealDexDataset 对象
-    dataset = RealDexDataset(
-        zarr_path="/home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/10-26/panda_dp1.zarr",  # 你需要提供一个有效的 zarr 文件路径
-        horizon=1,
-        pad_before=0,
-        pad_after=0,
-        seed=42,
-        val_ratio=0.0,
-        max_train_episodes=None,
-        task_name=None,
-    )
-
-    # 获取索引为 1 的元素
-    item1 = dataset[1]
-    print(item1)
-if __name__ == "__main__":
-    main()

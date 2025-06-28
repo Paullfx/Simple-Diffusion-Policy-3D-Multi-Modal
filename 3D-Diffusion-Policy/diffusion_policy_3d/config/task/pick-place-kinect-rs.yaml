@@ -1,6 +1,6 @@
 name: realdex_pour
 
-task_name: pick-place-kinect-rs-dot
+task_name: pick-place-kinect-rs
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
@@ -21,7 +21,7 @@ env_runner: null
 
 dataset:
   _target_: diffusion_policy_3d.dataset.realdex_dataset_mm.RealDexDatasetMM
-  zarr_path: /home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/1-12-complete/pick-place-kinect-rs-dot-opt.zarr
+  zarr_path: data/12-20-complete/pick-place-kinect-rs.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

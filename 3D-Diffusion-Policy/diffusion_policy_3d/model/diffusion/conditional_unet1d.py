@@ -126,6 +126,7 @@ class ConditionalResidualBlock1D(nn.Module):
                 embed = self.cond_encoder(x.permute(0, 2, 1), cond)
                 embed = embed.permute(0, 2, 1) # [batch_size, out_channels, horizon]
                 out = out + embed
+            #这里和之前的差别就是加了一个cross_attention，先进行了cross_attention，然后再进行了film
             elif self.condition_type == 'cross_attention_film':
                 embed = self.cond_encoder(x.permute(0, 2, 1), cond)
                 embed = embed.permute(0, 2, 1)

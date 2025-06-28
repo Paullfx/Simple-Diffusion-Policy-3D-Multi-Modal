@@ -9,19 +9,41 @@ from termcolor import cprint
 import copy
 import time
 import pytorch3d.ops as torch3d_ops
-from collections import OrderedDict
 
 from diffusion_policy_3d.model.common.normalizer import LinearNormalizer
 from diffusion_policy_3d.policy.base_policy import BasePolicy
-from diffusion_policy_3d.model.diffusion.conditional_unet1d import ConditionalUnet1D
+from diffusion_policy_3d.model.diffusion.simple_conditional_unet1d import ConditionalUnet1D, ConditionalUnet1DShorter
 from diffusion_policy_3d.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy_3d.common.pytorch_util import dict_apply
 from diffusion_policy_3d.common.model_util import print_params
 from diffusion_policy_3d.model.vision.pointnet_extractor import DP3Encoder
-
 import time
 
-class DP3(BasePolicy):
+def custom_loss(pred, target, mask):
+    pred_regression = pred[:, :, :6]
+    target_regression = target[:, :, :6]
+
+    pred_classification = pred[:, :, 6:]
+    target_classification = target[:, :, 6:]
+    target_classification = torch.argmax(target_classification, dim=-1)
+
+    mse_loss = F.mse_loss(pred_regression, target_regression, reduction='none')
+    mse_loss = mse_loss * mask[:, :, :6].type(mse_loss.dtype)
+    mse_loss = reduce(mse_loss, 'b ... -> b', 'mean')  
+    mse_loss = mse_loss.mean()
+
+    cross_entropy_loss = F.cross_entropy(pred_classification.permute(0, 2, 1), target_classification, reduction='none')
+    cross_entropy_loss = cross_entropy_loss * mask[:, :, 0].type(cross_entropy_loss.dtype)
+    cross_entropy_loss = reduce(cross_entropy_loss, 'b ... -> b', 'mean') 
+    cross_entropy_loss = cross_entropy_loss.mean()
+    
+    weight_mse = 1.0  
+    weight_ce = 1.0   
+    
+    loss = weight_mse * mse_loss + weight_ce * cross_entropy_loss
+    return loss
+
+class SimpleDP3Shorter(BasePolicy):
     def __init__(self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
@@ -62,7 +84,6 @@ class DP3(BasePolicy):
         obs_shape_meta = shape_meta['obs']
         obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
 
-
         obs_encoder = DP3Encoder(observation_space=obs_dict,
                                                    img_crop_shape=crop_shape,
                                                 out_channel=encoder_output_dim,
@@ -85,12 +106,11 @@ class DP3(BasePolicy):
 
         self.use_pc_color = use_pc_color
         self.pointnet_type = pointnet_type
-        cprint(f"[DiffusionUnetHybridPointcloudPolicy] use_pc_color: {self.use_pc_color}", "yellow")
-        cprint(f"[DiffusionUnetHybridPointcloudPolicy] pointnet_type: {self.pointnet_type}", "yellow")
+        cprint(f"[SDP3] use_pc_color: {self.use_pc_color}", "yellow")
+        cprint(f"[SDP3] pointnet_type: {self.pointnet_type}", "yellow")
 
 
-
-        model = ConditionalUnet1D(
+        model = ConditionalUnet1DShorter(
             input_dim=input_dim,
             local_cond_dim=None,
             global_cond_dim=global_cond_dim,
@@ -189,6 +209,7 @@ class DP3(BasePolicy):
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
         this_n_point_cloud = nobs['point_cloud']
         
+        
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -200,13 +221,13 @@ class DP3(BasePolicy):
         device = self.device
         dtype = self.dtype
 
+        obs_start_time = time.time()
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
         if self.obs_as_global_cond:
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            # 输出是B*T*128
             nobs_features = self.obs_encoder(this_nobs)
             if "cross_attention" in self.condition_type:
                 # treat as a sequence
@@ -228,6 +249,7 @@ class DP3(BasePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
+        sample_start_time = time.time()
         # run sampling
         nsample = self.conditional_sample(
             cond_data, 
@@ -238,22 +260,23 @@ class DP3(BasePolicy):
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
+        #action_pred = self.normalizer['action'].custom_unnormalize(naction_pred)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
         start = To - 1
         end = start + self.n_action_steps
         action = action_pred[:,start:end]
-        
+        adopt_flag = torch.zeros(size=(B, 1), device=self.device, dtype=torch.bool)
+        adopt_flag = adopt_flag.squeeze(-1)
         # get prediction
-
 
         result = {
             'action': action,
             'action_pred': action_pred,
         }
         
-        return result
+        return result, adopt_flag
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -261,12 +284,13 @@ class DP3(BasePolicy):
 
     def compute_loss(self, batch):
         # normalize input
-
         nobs = self.normalizer.normalize(batch['obs'])
+        #nactions = self.normalizer['action'].custom_normalize(batch['action'])
         nactions = self.normalizer['action'].normalize(batch['action'])
 
         if not self.use_pc_color:
             nobs['point_cloud'] = nobs['point_cloud'][..., :3]
+        
         
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
@@ -276,8 +300,6 @@ class DP3(BasePolicy):
         global_cond = None
         trajectory = nactions
         cond_data = trajectory
-        
-       
         
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
@@ -302,7 +324,6 @@ class DP3(BasePolicy):
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory = cond_data.detach()
-
 
         # generate impainting mask
         condition_mask = self.mask_generator(trajectory.shape)
@@ -337,7 +358,7 @@ class DP3(BasePolicy):
                         timestep=timesteps, 
                             local_cond=local_cond, 
                             global_cond=global_cond)
-
+        
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -359,12 +380,12 @@ class DP3(BasePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
+        #loss = custom_loss(pred, target, loss_mask)
         loss = F.mse_loss(pred, target, reduction='none')
         loss = loss * loss_mask.type(loss.dtype)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         
-
         loss_dict = {
                 'bc_loss': loss.item(),
             }
@@ -377,40 +398,3 @@ class DP3(BasePolicy):
         
         return loss, loss_dict
 
-if __name__ == "__main__":
-    import yaml
-
-    yaml_data = """
-    shape_meta: &shape_meta
-        obs:
-            point_cloud:
-                shape: [512, 3]
-                type: point_cloud
-            agent_pos:
-                shape: [24]
-                type: low_dim
-        action:
-            shape: [24]
-    """
-
-    # 使用 yaml 库的 load 方法将 YAML 数据转换为字典
-    shape_meta = yaml.safe_load(yaml_data)
-    obs_shape_meta = shape_meta['shape_meta']['obs']
-    print(obs_shape_meta)
-    def dict_apply(d, func):
-        return {k: func(v) for k, v in d.items()}
-
-    obs_dict = dict_apply(obs_shape_meta, lambda x: x['shape'])
-    observations = OrderedDict({
-        'point_cloud': torch.randn(20, 512, 3),  # 10个样本，每个样本有100个点，每个点有3个坐标
-        'agent_pos': torch.randn(20, 24),  # 10个样本，每个样本有一个代理位置
-        'imagin_robot': torch.randn(10, 2, 100, 3),  # 10个样本，每个样本有一个想象中的机器人位置
-    })
-    from omegaconf import OmegaConf
-    
-    cfg = OmegaConf.load('3D-Diffusion-Policy/3D-Diffusion-Policy/diffusion_policy_3d/config/dp3.yaml')
-
-    pointcloud_encoder_cfg = cfg.policy.pointcloud_encoder_cfg
-    encoder = DP3Encoder(observation_space=obs_dict, pointcloud_encoder_cfg=pointcloud_encoder_cfg)
-    encoded_observations = encoder(observations)
-    print(encoded_observations.shape)

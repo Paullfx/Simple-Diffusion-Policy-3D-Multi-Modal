@@ -1,5 +1,5 @@
 defaults:
-  - task: panda_pick_place_d455
+  - task: pick-place-l515
 
 name: train_simple_dp3
 
@@ -8,16 +8,16 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
-horizon: 3
+horizon: 4
 n_obs_steps: 2
-n_action_steps: 3
+n_action_steps: 2
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
 policy:
-  _target_: diffusion_policy_3d.policy.simple_dp3_proj_flag.SimpleDP3ProjFlag
+  _target_: diffusion_policy_3d.policy.simple_dp3_proj_flag_combine.SimpleDP3ProjFlagCombine
   use_point_crop: true
   condition_type: film
   use_down_condition: true

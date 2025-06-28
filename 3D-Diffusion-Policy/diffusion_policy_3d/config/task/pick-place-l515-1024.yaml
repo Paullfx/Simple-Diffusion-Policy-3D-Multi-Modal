@@ -1,15 +1,12 @@
 name: realdex_pour
 
-task_name: pick-place-kinect-rs-dot
+task_name: pick-place-l515
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim
   obs:
-    certainty_map:
-      shape: [3, 84, 84]
-      type: rgb
     point_cloud:
-      shape: [2048, 3]
+      shape: [1024, 3]
       type: point_cloud
     agent_pos:
       shape: [7]
@@ -20,8 +17,8 @@ shape_meta: &shape_meta
 env_runner: null
 
 dataset:
-  _target_: diffusion_policy_3d.dataset.realdex_dataset_mm.RealDexDatasetMM
-  zarr_path: /home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/1-12-complete/pick-place-kinect-rs-dot-opt.zarr
+  _target_: diffusion_policy_3d.dataset.realdex_dataset.RealDexDataset
+  zarr_path: /home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/4-15/pick-place-l515-v3-1024.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

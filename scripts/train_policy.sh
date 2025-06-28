@@ -4,6 +4,11 @@
 # bash scripts/train_policy.sh simple_dp3 adroit_hammer 0322 0 0
 # bash scripts/train_policy.sh dp3 metaworld_basketball 0602 0 0
 
+# bash scripts/train_policy.sh dp3 quadruped_walk_1 0010 0 0
+#                        algo_name  task_name   addition_info seed gpu_id
+
+# bash scripts/train_policy.sh diffusion_unet_lowdim_policy 
+# bash scripts/train_policy.sh simple_lowdim_dp quadruped_walk 0001 0 0 
 
 
 DEBUG=False
@@ -22,8 +27,8 @@ run_dir="data/outputs/${exp_name}_seed${seed}"
 gpu_id=${5}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
 
-
-if [ $DEBUG = True ]; then
+# if [ $DEBUG = True ]; then
+if [ "$DEBUG" = "True" ]; then
     wandb_mode=offline
     # wandb_mode=online
     echo -e "\033[33mDebug mode!\033[0m"
@@ -35,6 +40,7 @@ else
 fi
 
 cd 3D-Diffusion-Policy
+# cd 3D-Diffusion-Policy/3D-Diffusion-Policy
 
 
 export HYDRA_FULL_ERROR=1 
@@ -47,6 +53,7 @@ python train.py --config-name=${config_name}.yaml \
                             training.device="cuda:0" \
                             exp_name=${exp_name} \
                             logging.mode=${wandb_mode} \
+                            addition_info=${addition_info} \
                             checkpoint.save_ckpt=${save_ckpt}
 
 

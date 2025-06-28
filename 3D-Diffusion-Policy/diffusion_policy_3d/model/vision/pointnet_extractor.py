@@ -227,7 +227,6 @@ class DP3Encoder(nn.Module):
             self.imagination_shape = observation_space[self.imagination_key]
         else:
             self.imagination_shape = None
-            
         
         
         cprint(f"[DP3Encoder] point cloud shape: {self.point_cloud_shape}", "yellow")
@@ -268,7 +267,7 @@ class DP3Encoder(nn.Module):
         if self.use_imagined_robot:
             img_points = observations[self.imagination_key][..., :points.shape[-1]] # align the last dim
             points = torch.concat([points, img_points], dim=1)
-        
+    
         # points = torch.transpose(points, 1, 2)   # B * 3 * N
         # points: B * 3 * (N + sum(Ni))
         pn_feat = self.extractor(points)    # B * out_channel

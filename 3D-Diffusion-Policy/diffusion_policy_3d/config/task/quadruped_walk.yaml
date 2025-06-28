@@ -1,0 +1,27 @@
+name: realdex_pour
+
+task_name: quadruped_walk # pick-place-l515-state-only
+
+shape_meta: &shape_meta
+  obs:
+    agent_pos:
+      shape: [12] #12
+      type: low_dim
+  action:
+    shape: [4] #12
+
+obs_dim: 12 #12
+action_dim: 4 #12
+
+env_runner: null
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.realdex_dataset_state.RealDexDatasetState
+  zarr_path: /home/hamilton/data/quadruped_walk/quadruped_walk_5hz_CMVasACTION.zarr # /home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/4-15/pick-place-l515-v2.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 90
+

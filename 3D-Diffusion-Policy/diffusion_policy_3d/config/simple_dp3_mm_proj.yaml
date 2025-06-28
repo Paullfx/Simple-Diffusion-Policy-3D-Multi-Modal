@@ -1,31 +1,29 @@
 defaults:
-  - task: panda_pick_place_d455
+  - task: pick-place-kinect-rs
 
-name: train_simple_dp3
+name: train_simple_dp3_mm
 
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "debug"
 
-horizon: 3
+horizon: 4
 n_obs_steps: 2
-n_action_steps: 3
+n_action_steps: 4
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
 policy:
-  _target_: diffusion_policy_3d.policy.simple_dp3_proj_flag.SimpleDP3ProjFlag
+  _target_: diffusion_policy_3d.policy.simple_dp3_mm_proj.SimpleDP3MMProj
   use_point_crop: true
   condition_type: film
   use_down_condition: true
   use_mid_condition: true
   use_up_condition: true
-  train_gripper_length: 0.099
-  end_effector_length: 0.099
-  
+  encoder_output_dim: 256
   diffusion_step_embed_dim: 128
   #main difference between simple_dp3 and dp3
   down_dims:
@@ -35,12 +33,14 @@ policy:
   crop_shape:
   - 80
   - 80
-  encoder_output_dim: 64
   horizon: ${horizon}
   kernel_size: 5
   n_action_steps: ${n_action_steps}
   n_groups: 8
   n_obs_steps: ${n_obs_steps}
+  train_gripper_length: 0.099
+  end_effector_length: 0.099
+  adapt_height: False
 
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
@@ -53,27 +53,37 @@ policy:
     steps_offset: 0
     prediction_type: sample
 
-
   num_inference_steps: 10
   obs_as_global_cond: true
   shape_meta: ${shape_meta}
-
-
 
   # whether to use point cloud's color
   use_pc_color: false
   # type of pointnet
   pointnet_type: "pointnet"
 
-
-  pointcloud_encoder_cfg:
-    in_channels: 3
-    out_channels: ${policy.encoder_output_dim}
-    use_layernorm: true
-    final_norm: layernorm # layernorm, none
-    normal_channel: false
-
-
+  multi_modal_encoder:
+    _target_: diffusion_policy_3d.model.vision.multi_modal_obs_encoder.MultiModalEncoder
+    shape_meta: ${shape_meta}
+    use_pc_color: false
+    pointnet_type: "pointnet"
+    rgb_model:
+      _target_: diffusion_policy_3d.model.vision.model_getter.get_resnet
+      name: resnet18
+      out_channels: 64
+      weights: null
+    pointcloud_encoder_cfg:
+      in_channels: 3
+      out_channels: ${policy.encoder_output_dim}
+      use_layernorm: true
+      final_norm: layernorm # layernorm, none
+      normal_channel: false
+    resize_shape: null
+    crop_shape: [76, 76]
+    random_crop: False
+    use_group_norm: True
+    imagenet_norm: True
+    
 ema:
   _target_: diffusion_policy_3d.model.diffusion.ema_model.EMAModel
   update_after_step: 0
@@ -110,7 +120,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 6000
+  num_epochs: 4000
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 200

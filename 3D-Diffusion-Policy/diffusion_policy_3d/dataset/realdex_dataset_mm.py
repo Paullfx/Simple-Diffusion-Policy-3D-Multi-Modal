@@ -93,3 +93,22 @@ class RealDexDatasetMM(BaseDataset):
         data = self._sample_to_data(sample)
         torch_data = dict_apply(data, torch.from_numpy)
         return torch_data
+
+def main():
+    # 创建 RealDexDataset 对象
+    dataset = RealDexDataset(
+        zarr_path="/home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/11-20/pick-place-kinect-rs.zarr",  # 你需要提供一个有效的 zarr 文件路径
+        horizon=1,
+        pad_before=0,
+        pad_after=0,
+        seed=42,
+        val_ratio=0.0,
+        max_train_episodes=None,
+        task_name=None,
+    )
+
+    # 获取索引为 1 的元素
+    item1 = dataset[1]
+    print(item1)
+if __name__ == "__main__":
+    main()

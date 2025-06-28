@@ -39,7 +39,7 @@ policy:
   n_groups: 8
   n_obs_steps: ${n_obs_steps}
   train_gripper_length: 0.099
-  end_effector_length: 0.14
+  end_effector_length: 0.089
   # robotiq : 0.089
   # long gripper: 0.14
   # short gripper: 0.063

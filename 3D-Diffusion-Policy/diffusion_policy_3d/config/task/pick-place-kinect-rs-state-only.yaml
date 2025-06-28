@@ -1,0 +1,26 @@
+name: realdex_pour
+
+task_name: pick-place-kinect-rs-state-only
+
+shape_meta: &shape_meta
+  obs:
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [8]
+
+obs_dim: 7
+action_dim: 8
+
+env_runner: null
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.realdex_dataset_state.RealDexDatasetState
+  zarr_path: /home/yxt/thesis/yirui/imitation/3D-Diffusion-Policy/3D-Diffusion-Policy/data/4-15/pick-place-l515-v2.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.02
+  max_train_episodes: 90
