@@ -43,5 +43,6 @@ dexdeform_demonstrations.zip
 personal_TASK.md
 easytrain.sh
 nohup.out
-output/pytorch3d/
+output/
+pytorch3d/
 r3m/
