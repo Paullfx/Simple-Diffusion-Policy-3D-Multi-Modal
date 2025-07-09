@@ -1,6 +1,19 @@
-from typing import Dict
+"""diffusion_unet_lowdim_proj_quadruped.py
+================================================
+Pure **yaw‑compensation** diffusion policy for the quadruped‑walk task.
+
+This policy injects a configurable yaw‑velocity offset into the `yaw_index`
+action dimension when the external IMU roll (Euler `rpy0`) drifts outside a
+small dead‑band.
+
+The `projection()` is called automatically from `conditional_sample()` so all
+returned trajectories are already compensated.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
@@ -10,26 +23,47 @@ from diffusion_policy_3d.policy.base_policy import BasePolicy
 from diffusion_policy_3d.model.diffusion.simple_conditional_unet1d import ConditionalUnet1D
 from diffusion_policy_3d.model.diffusion.mask_generator import LowdimMaskGenerator
 
-class DiffusionUnetLowdimPolicy(BasePolicy):
-    def __init__(self, 
-            model: ConditionalUnet1D,
-            noise_scheduler: DDPMScheduler,
-            horizon, 
-            obs_dim, 
-            action_dim, 
-            n_action_steps, 
-            n_obs_steps,
-            num_inference_steps=None,
-            obs_as_local_cond=False,
-            obs_as_global_cond=False,
-            pred_action_steps_only=False,
-            oa_step_convention=False,
-            # parameters passed to step
-            **kwargs):
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+class DiffusionUnetLowdimProjQuadruped(BasePolicy):
+    """Low‑dim diffusion policy with **IMU‑based yaw compensation** only."""
+
+    def __init__(
+        self,
+        model: ConditionalUnet1D,
+        noise_scheduler: DDPMScheduler,
+        *,
+        horizon: int,
+        obs_dim: int,
+        action_dim: int,
+        n_action_steps: int,
+        n_obs_steps: int,
+        # yaw‑compensation knobs
+        additional_yaw_gain: float = 0.15,  # rad/s added when |rpy0|>thr
+        rpy_threshold: float = 0.02,        # rad – dead‑band threshold
+        yaw_index: int = 4,                 # which action dim is yaw vel
+        # standard diffusion policy knobs
+        num_inference_steps: Optional[int] = None,
+        obs_as_local_cond: bool = False,
+        obs_as_global_cond: bool = False,
+        pred_action_steps_only: bool = False,
+        oa_step_convention: bool = False,
+        **kwargs,
+    ):
         super().__init__()
         assert not (obs_as_local_cond and obs_as_global_cond)
         if pred_action_steps_only:
             assert obs_as_global_cond
+
+        # --- store yaw compensation knobs ---
+        self.additional_yaw_gain = additional_yaw_gain
+        self.rpy_threshold = rpy_threshold
+        self.yaw_index = yaw_index
+
+        # --- standard diffusion policy init ---
         self.model = model
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
@@ -37,9 +71,10 @@ class DiffusionUnetLowdimPolicy(BasePolicy):
             obs_dim=0 if (obs_as_local_cond or obs_as_global_cond) else obs_dim,
             max_n_obs_steps=n_obs_steps,
             fix_obs_steps=True,
-            action_visible=False
+            action_visible=False,
         )
         self.normalizer = LinearNormalizer()
+
         self.horizon = horizon
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -54,57 +89,76 @@ class DiffusionUnetLowdimPolicy(BasePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
-    
-    # ========= inference  ============
-    def conditional_sample(self, 
-            condition_data, condition_mask,
-            local_cond=None, global_cond=None,
-            generator=None,
-            # keyword arguments to scheduler.step
-            **kwargs
-            ):
+
+    # ------------------------------------------------------------------
+    # Inference with built‑in projection
+    # ------------------------------------------------------------------
+    def conditional_sample(
+        self,
+        condition_data: torch.Tensor,
+        condition_mask: torch.Tensor,
+        *,
+        local_cond: Optional[torch.Tensor] = None,
+        global_cond: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        # special arg for this policy
+        imu_euler: float = 0.0,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Runs DDPM sampling and applies yaw compensation after each step."""
         model = self.model
         scheduler = self.noise_scheduler
 
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
-            generator=generator)
-    imitation
-                local_cond=local_cond, global_cond=global_cond)
+        trajectory = torch.randn_like(condition_data, generator=generator)
+        scheduler.set_timesteps(self.num_inference_steps)
 
-            # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
-                generator=generator,
-                **kwargs
-                ).prev_sample
-        
-        # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        infernce_step = 0
+        for t in scheduler.timesteps:
+            # enforce conditioning
+            trajectory[condition_mask] = condition_data[condition_mask]
 
+            # predict noise
+            model_out = model(trajectory, t, local_cond=local_cond, global_cond=global_cond)
+
+            # compute previous sample
+            trajectory = scheduler.step(model_out, t, trajectory, **kwargs).prev_sample
+
+            # --- yaw compensation on un-normalised actions ---
+            # (un-normalize, project, re-normalize)
+            if inference_step >= 7:
+                naction = trajectory[..., :self.action_dim]
+                action = self.normalizer['action'].unnormalize(naction)
+                action = self.projection(action, imu_euler)
+                trajectory[..., :self.action_dim] = self.normalizer['action'].normalize(action)
+            inference_step += 1 
+        # final conditioning
+        trajectory[condition_mask] = condition_data[condition_mask]
         return trajectory
 
+    def projection(self, x: torch.Tensor, imu_euler: float) -> torch.Tensor:
+        """Add yaw offset if |imu_euler| > threshold."""
+        if abs(imu_euler) <= self.rpy_threshold:
+            return x
+        yaw_offset = self.additional_yaw_gain if imu_euler > 0 else -self.additional_yaw_gain
+        x = x.clone()
+        x[..., self.yaw_index] += yaw_offset
+        return x
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         """
-        obs_dict: must include "obs" key
-        result: must include "action" key
+        obs_dict: must include "obs" key.
+        kwargs: must include "imu_euler" for this policy.
+        result: must include "action" key.
         """
-        # debug session
-        # print(f"[DEBUG] predict_action received type = {type(obs_dict)}")
+        assert 'obs' in obs_dict
+        assert 'past_action' not in obs_dict
+        assert 'imu_euler' in kwargs, "imu_euler must be provided for projection"
 
-        # assert 'obs' in obs_dict # debug
-        assert 'past_action' not in obs_dict # not implemented yet
         nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
         B, _, Do = nobs.shape
         To = self.n_obs_steps
-        assert Do == self.obs_dim
         T = self.horizon
         Da = self.action_dim
-
-        # build input
         device = self.device
         dtype = self.dtype
 
@@ -112,62 +166,41 @@ class DiffusionUnetLowdimPolicy(BasePolicy):
         local_cond = None
         global_cond = None
         if self.obs_as_local_cond:
-            # condition through local feature
-            # all zero except first To timesteps
-            local_cond = torch.zeros(size=(B,T,Do), device=device, dtype=dtype)
-            local_cond[:,:To] = nobs[:,:To]
+            local_cond = torch.zeros((B, T, Do), device=device, dtype=dtype)
+            local_cond[:, :To] = nobs
             shape = (B, T, Da)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
+            cond_data = torch.zeros(shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         elif self.obs_as_global_cond:
-            # condition throught global feature
-            global_cond = nobs[:,:To].reshape(nobs.shape[0], -1)
-            shape = (B, T, Da)
-            if self.pred_action_steps_only:
-                shape = (B, self.n_action_steps, Da)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
+            global_cond = nobs.reshape(B, -1)
+            shape = (B, self.n_action_steps if self.pred_action_steps_only else T, Da)
+            cond_data = torch.zeros(shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
-            # condition through impainting
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
+            shape = (B, T, Da + Do)
+            cond_data = torch.zeros(shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs[:,:To]
-            cond_mask[:,:To,Da:] = True
+            cond_data[:, :To, Da:] = nobs
+            cond_mask[:, :To, Da:] = True
 
-        # run sampling
+        # run sampling with projection
         nsample = self.conditional_sample(
-            cond_data, 
-            cond_mask,
-            local_cond=local_cond,
-            global_cond=global_cond,
-            **self.kwargs)
-        
+            cond_data, cond_mask, local_cond=local_cond, global_cond=global_cond, **kwargs
+        )
+
         # unnormalize prediction
-        naction_pred = nsample[...,:Da]
+        naction_pred = nsample[..., :Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         # get action
-        if self.pred_action_steps_only:
-            action = action_pred
-        else:
-            start = To
-            if self.oa_step_convention:
-                start = To - 1
-            end = start + self.n_action_steps
-            action = action_pred[:,start:end]
-        
-        result = {
-            'action': action,
-            'action_pred': action_pred
-        }
-        if not (self.obs_as_local_cond or self.obs_as_global_cond):
-            nobs_pred = nsample[...,Da:]
-            obs_pred = self.normalizer['obs'].unnormalize(nobs_pred)
-            action_obs_pred = obs_pred[:,start:end]
-            result['action_obs_pred'] = action_obs_pred
-            result['obs_pred'] = obs_pred
+        start = To if not self.oa_step_convention else To - 1
+        end = start + self.n_action_steps
+        action = action_pred[:, start:end]
+
+        result = {'action': action, 'action_pred': action_pred}
         return result
+
+    # ------------------------------------------------------------------
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -252,3 +285,4 @@ class DiffusionUnetLowdimPolicy(BasePolicy):
             }
         
         return loss, loss_dict
+
