@@ -71,8 +71,17 @@ class DiffusionUnetLowdimPolicy(BasePolicy):
             dtype=condition_data.dtype,
             device=condition_data.device,
             generator=generator)
-    imitation
-                local_cond=local_cond, global_cond=global_cond)
+        
+            
+        # set step values
+        scheduler.set_timesteps(self.num_inference_steps)
+
+        for t in scheduler.timesteps:
+            # 1. apply conditioning
+            trajectory[condition_mask] = condition_data[condition_mask]
+
+            # 2. predict model output
+            model_output = model(trajectory, t, local_cond=local_cond, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(

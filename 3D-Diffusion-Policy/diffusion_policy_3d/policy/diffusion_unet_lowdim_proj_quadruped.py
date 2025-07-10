@@ -42,8 +42,8 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         n_action_steps: int,
         n_obs_steps: int,
         # yaw‑compensation knobs
-        additional_yaw_gain: float = 0.15,  # rad/s added when |rpy0|>thr
-        rpy_threshold: float = 0.02,        # rad – dead‑band threshold
+        additional_yaw_gain: float = 0.001,  # rad/s added when |rpy0|>thr
+        rpy_threshold: float = 0.035,        # rad – dead‑band threshold
         yaw_index: int = 4,                 # which action dim is yaw vel
         # standard diffusion policy knobs
         num_inference_steps: Optional[int] = None,
@@ -109,10 +109,14 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         model = self.model
         scheduler = self.noise_scheduler
 
-        trajectory = torch.randn_like(condition_data, generator=generator)
+        # Patch for torch <1.7: generator argument not supported in randn_like
+        if generator is not None:
+            trajectory = torch.randn(condition_data.shape, dtype=condition_data.dtype, device=condition_data.device, generator=generator)
+        else:
+            trajectory = torch.randn_like(condition_data)
         scheduler.set_timesteps(self.num_inference_steps)
 
-        infernce_step = 0
+        inference_step = 0
         for t in scheduler.timesteps:
             # enforce conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
@@ -136,12 +140,29 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         return trajectory
 
     def projection(self, x: torch.Tensor, imu_euler: float) -> torch.Tensor:
-        """Add yaw offset if |imu_euler| > threshold."""
-        if abs(imu_euler) <= self.rpy_threshold:
+        """Add yaw offset if |imu_euler| > threshold.""" 
+        # rpy0 euler angle reduces when the robot is pulled by human and incline on the left side
+        # yaw speed reduces if robot rotate cloclwise from bird-eye view
+        # Let's print the value every time to check
+        # print(f"Projection called with imu_euler: {imu_euler:.4f}, threshold: {self.rpy_threshold:.4f}")
+        # if abs(imu_euler) <= self.rpy_threshold:
+        #     print("Projection not activated: imu_euler within threshold.")
+        #     return x
+        # print("Projection activated: imu_euler exceeds threshold.")
+        # if abs(imu_euler) <= self.rpy_threshold:
+        #     return x
+        yaw_offset = 0.0
+        if imu_euler > self.rpy_threshold:
+            yaw_offset = -self.additional_yaw_gain
+            print("euler angle larger than threshold, guidance on the right side")
+        elif imu_euler < -self.rpy_threshold:
+            yaw_offset = self.additional_yaw_gain
+            print("euler angle smaller than negative threshold, guidance on the left side")
+        else:
             return x
-        yaw_offset = self.additional_yaw_gain if imu_euler > 0 else -self.additional_yaw_gain
         x = x.clone()
         x[..., self.yaw_index] += yaw_offset
+        # print(f"x after projection:{x}")
         return x
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:

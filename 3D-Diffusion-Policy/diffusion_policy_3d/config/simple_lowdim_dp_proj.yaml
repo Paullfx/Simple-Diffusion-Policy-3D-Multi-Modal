@@ -58,8 +58,8 @@ policy:
   pred_action_steps_only: ${pred_action_steps_only}
   oa_step_convention: True
   # yaw-compensation knobs
-  additional_yaw_gain: 0.15
-  rpy_threshold: 0.02
+  additional_yaw_gain: 0.03
+  rpy_threshold: 0.050
   yaw_index: 3 # Index for yaw velocity in the action vector (e.g., 4th element is index 3)
 
 ema:
