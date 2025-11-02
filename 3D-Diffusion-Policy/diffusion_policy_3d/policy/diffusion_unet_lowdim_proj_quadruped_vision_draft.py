@@ -1,17 +1,14 @@
-# diffusion_unet_lowdim_proj_quadruped.py
-# ================================================================
-# Pure **yaw-compensation** diffusion policy for the quadruped-walk task.
-#
-# This policy injects a configurable yaw-velocity offset into the `yaw_index`
-# action dimension when the external IMU roll (Euler `rpy0`) drifts outside a
-# small dead-band.
-#
-# The compensation is applied during inference inside the DDPM loop:
-#   • Starts from inference step 7 (after a few denoising steps stabilize)
-#   • When |imu_euler| > rpy_threshold, we apply the offset on the *current*
-#     iteration and keep applying it for the next (post_trigger_iters-1) steps.
-#   • Each new policy call is independent (no persistence across calls).
-# ================================================================
+"""diffusion_unet_lowdim_proj_quadruped.py
+================================================
+Pure **yaw‑compensation** diffusion policy for the quadruped‑walk task.
+
+This policy injects a configurable yaw‑velocity offset into the `yaw_index`
+action dimension when the external IMU roll (Euler `rpy0`) drifts outside a
+small dead‑band.
+
+The `projection()` is called automatically from `conditional_sample()` so all
+returned trajectories are already compensated.
+"""
 
 from __future__ import annotations
 
@@ -27,8 +24,12 @@ from diffusion_policy_3d.model.diffusion.simple_conditional_unet1d import Condit
 from diffusion_policy_3d.model.diffusion.mask_generator import LowdimMaskGenerator
 
 
-class DiffusionUnetLowdimProjQuadruped(BasePolicy):
-    """Low-dim diffusion policy with **IMU-based yaw compensation** only."""
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+class DiffusionUnetLowdimProjQuadrupedVision(BasePolicy):
+    """Low‑dim diffusion policy with **vision guidance with aruco detection** only."""
 
     def __init__(
         self,
@@ -40,12 +41,10 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         action_dim: int,
         n_action_steps: int,
         n_obs_steps: int,
-        # yaw-compensation knobs
-        additional_yaw_gain: float = 0.005,   # rad/s added when |rpy0|>thr (per application)
-        rpy_threshold: float = 0.070,         # rad – dead-band threshold
-        yaw_index: int = 4,                   # which action dim is yaw vel
-        # NEW: scheduled application count (includes the current triggering iteration)
-        post_trigger_iters: int = 2,          # total applications = current + next (N-1)
+        # yaw‑compensation knobs
+        additional_yaw_gain: float = 0.001,  # rad/s added when |rpy0|>thr
+        rpy_threshold: float = 0.035,        # rad – dead‑band threshold
+        yaw_index: int = 4,                 # which action dim is yaw vel
         # standard diffusion policy knobs
         num_inference_steps: Optional[int] = None,
         obs_as_local_cond: bool = False,
@@ -60,10 +59,9 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
             assert obs_as_global_cond
 
         # --- store yaw compensation knobs ---
-        self.additional_yaw_gain = float(additional_yaw_gain)
-        self.rpy_threshold = float(rpy_threshold)
-        self.yaw_index = int(yaw_index)
-        self.post_trigger_iters = max(int(post_trigger_iters), 0)
+        self.additional_yaw_gain = additional_yaw_gain
+        self.rpy_threshold = rpy_threshold
+        self.yaw_index = yaw_index
 
         # --- standard diffusion policy init ---
         self.model = model
@@ -93,7 +91,7 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         self.num_inference_steps = num_inference_steps
 
     # ------------------------------------------------------------------
-    # Inference with scheduled yaw-offset projection
+    # Inference with built‑in projection
     # ------------------------------------------------------------------
     def conditional_sample(
         self,
@@ -107,25 +105,16 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         imu_euler: float = 0.0,
         **kwargs,
     ) -> torch.Tensor:
-        """Runs DDPM sampling and applies yaw compensation according to schedule."""
+        """Runs DDPM sampling and applies yaw compensation after each step."""
         model = self.model
         scheduler = self.noise_scheduler
 
-        # Init latent trajectory
+        # Patch for torch <1.7: generator argument not supported in randn_like
         if generator is not None:
-            trajectory = torch.randn(
-                condition_data.shape,
-                dtype=condition_data.dtype,
-                device=condition_data.device,
-                generator=generator,
-            )
+            trajectory = torch.randn(condition_data.shape, dtype=condition_data.dtype, device=condition_data.device, generator=generator)
         else:
             trajectory = torch.randn_like(condition_data)
         scheduler.set_timesteps(self.num_inference_steps)
-
-        # NEW: state for "apply now + next K iterations"
-        apply_for = 0                 # remaining future iterations to apply
-        cached_yaw_offset = 0.0       # signed offset to apply during countdown
 
         inference_step = 0
         for t in scheduler.timesteps:
@@ -139,69 +128,48 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
             trajectory = scheduler.step(model_out, t, trajectory, **kwargs).prev_sample
 
             # --- yaw compensation on un-normalised actions ---
-            # (un-normalize, (maybe) project, re-normalize)
+            # (un-normalize, project, re-normalize)
             if inference_step >= 7:
                 naction = trajectory[..., :self.action_dim]
                 action = self.normalizer['action'].unnormalize(naction)
-
-                if apply_for > 0:
-                    print(f"[Projection Active] applying cached yaw offset {cached_yaw_offset:+.4f} "
-                            f"for remaining {apply_for} iterations")
-                    # We are in the scheduled-application window
-                    action = self._apply_yaw_offset(action, cached_yaw_offset)
-                    apply_for -= 1
-                else:
-                    # Not currently applying; check if a new trigger happens **now**
-                    yaw_offset_now = self._compute_yaw_offset(imu_euler)
-                    if yaw_offset_now != 0.0:
-                        cached_yaw_offset = yaw_offset_now
-                        # ✅ include the current iteration
-                        action = self._apply_yaw_offset(action, cached_yaw_offset)
-                        # then keep applying for the next (post_trigger_iters - 1) iterations
-                        apply_for = max(self.post_trigger_iters - 1, 0)
-
+                action = self.projection(action, imu_euler)
                 trajectory[..., :self.action_dim] = self.normalizer['action'].normalize(action)
-
-            inference_step += 1
-
+            inference_step += 1 
         # final conditioning
         trajectory[condition_mask] = condition_data[condition_mask]
         return trajectory
 
-    # ---- helper methods for new scheduling logic ----
-    def _compute_yaw_offset(self, imu_euler: float) -> float:
-        """Return signed yaw offset based on imu_euler and thresholds; 0.0 if no trigger."""
+    def projection(self, x: torch.Tensor, imu_euler: float) -> torch.Tensor:
+        """Add yaw offset if |imu_euler| > threshold.""" 
+        # rpy0 euler angle reduces when the robot is pulled by human and incline on the left side
+        # yaw speed reduces if robot rotate cloclwise from bird-eye view
+        # Let's print the value every time to check
+        # print(f"Projection called with imu_euler: {imu_euler:.4f}, threshold: {self.rpy_threshold:.4f}")
+        # if abs(imu_euler) <= self.rpy_threshold:
+        #     print("Projection not activated: imu_euler within threshold.")
+        #     return x
+        # print("Projection activated: imu_euler exceeds threshold.")
+        # if abs(imu_euler) <= self.rpy_threshold:
+        #     return x
+        yaw_offset = 0.0
         if imu_euler > self.rpy_threshold:
-            print(f"[Projection Triggered] imu_euler={imu_euler:.4f} > +{self.rpy_threshold:.4f} → steering right (-yaw)")
-            return -self.additional_yaw_gain
-        if imu_euler < -self.rpy_threshold:
-            print(f"[Projection Triggered] imu_euler={imu_euler:.4f} < -{self.rpy_threshold:.4f} → steering left (+yaw)")
-            return self.additional_yaw_gain
-        return 0.0
-
-
-    def _apply_yaw_offset(self, x: torch.Tensor, yaw_offset: float) -> torch.Tensor:
-        """Apply a concrete yaw offset to the yaw_index of unnormalized action tensor x."""
-        if yaw_offset == 0.0:
+            yaw_offset = -self.additional_yaw_gain
+            print("euler angle larger than threshold, guidance on the right side")
+        elif imu_euler < -self.rpy_threshold:
+            yaw_offset = self.additional_yaw_gain
+            print("euler angle smaller than negative threshold, guidance on the left side")
+        else:
             return x
         x = x.clone()
         x[..., self.yaw_index] += yaw_offset
+        # print(f"x after projection:{x}")
         return x
 
-    # ---- legacy projection (kept for compatibility; no longer used internally) ----
-    def projection(self, x: torch.Tensor, imu_euler: float) -> torch.Tensor:
-        """(Legacy) Add yaw offset if |imu_euler| > threshold, one-shot application."""
-        yaw_offset = self._compute_yaw_offset(imu_euler)
-        if yaw_offset == 0.0:
-            return x
-        return self._apply_yaw_offset(x, yaw_offset)
-
-    # ---- public API ----
     def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key.
-        kwargs:  must include "imu_euler" for yaw compensation to work.
-        result:  includes "action" (the to-execute steps) and "action_pred" (full horizon).
+        kwargs: must include "imu_euler" for this policy.
+        result: must include "action" key.
         """
         assert 'obs' in obs_dict
         assert 'past_action' not in obs_dict
@@ -236,7 +204,7 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
             cond_data[:, :To, Da:] = nobs
             cond_mask[:, :To, Da:] = True
 
-        # run sampling with scheduled projection
+        # run sampling with projection
         nsample = self.conditional_sample(
             cond_data, cond_mask, local_cond=local_cond, global_cond=global_cond, **kwargs
         )
@@ -245,13 +213,15 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         naction_pred = nsample[..., :Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
-        # get action window
+        # get action
         start = To if not self.oa_step_convention else To - 1
         end = start + self.n_action_steps
         action = action_pred[:, start:end]
 
         result = {'action': action, 'action_pred': action_pred}
         return result
+
+    # ------------------------------------------------------------------
 
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):
@@ -268,7 +238,7 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         Da = self.action_dim
         Do = self.obs_dim
         To = self.n_obs_steps
-
+        
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
@@ -276,20 +246,20 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         if self.obs_as_local_cond:
             # zero out observations after n_obs_steps
             local_cond = obs
-            local_cond[:, self.n_obs_steps:, :] = 0
+            local_cond[:,self.n_obs_steps:,:] = 0
         elif self.obs_as_global_cond:
-            global_cond = obs[:, :To, :].reshape(B, -1)
+            global_cond = obs[:,:To,:].reshape(B, -1)
             if self.pred_action_steps_only:
                 To = self.n_obs_steps
                 start = To
                 if self.oa_step_convention:
                     start = To - 1
                 end = start + self.n_action_steps
-                trajectory = action[:, start:end]
+                trajectory = action[:,start:end]
         else:
             trajectory = torch.cat([action, obs], dim=-1)
 
-        # generate inpainting mask
+        # generate impainting mask
         if self.pred_action_steps_only:
             condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
         else:
@@ -300,21 +270,25 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         bsz = trajectory.shape[0]
         # Sample a random timestep for each image
         timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
+            0, self.noise_scheduler.config.num_train_timesteps, 
             (bsz,), device=trajectory.device
         ).long()
-        # Forward diffusion
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, noise, timesteps)
-
-        # compute loss mask and apply conditioning
+        # Add noise to the clean images according to the noise magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_trajectory = self.noise_scheduler.add_noise(
+            trajectory, noise, timesteps)
+        
+        # compute loss mask
         loss_mask = ~condition_mask
+
+        # apply conditioning
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
-
+        
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps,
-                          local_cond=local_cond, global_cond=global_cond)
+        pred = self.model(noisy_trajectory, timesteps, 
+            local_cond=local_cond, global_cond=global_cond)
 
-        pred_type = self.noise_scheduler.config.prediction_type
+        pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
             target = noise
         elif pred_type == 'sample':
@@ -327,5 +301,9 @@ class DiffusionUnetLowdimProjQuadruped(BasePolicy):
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
 
-        loss_dict = {'bc_loss': loss.item()}
+        loss_dict = {
+                'bc_loss': loss.item(),
+            }
+        
         return loss, loss_dict
+
